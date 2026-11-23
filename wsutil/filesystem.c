@@ -1007,8 +1007,10 @@ get_current_working_dir(void)
 const char *
 get_datafile_dir(const char* app_env_var_prefix)
 {
-    if (datafile_dir != NULL)
-        return datafile_dir;
+    if (datafile_dir == NULL)
+        datafile_dir = g_strdup(DATA_DIR);
+
+    return datafile_dir;
 
     char *data_dir_envar = g_strdup_printf("%s_DATA_DIR", app_env_var_prefix);
     char* app_lower = g_ascii_strdown(app_env_var_prefix, -1);

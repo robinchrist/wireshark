@@ -1336,6 +1336,12 @@ static void snort_start(void)
     return;
 #endif
 
+#ifdef __EMSCRIPTEN__
+    report_failure("Snort dissector: not yet able to launch Snort process under WebAssembly");
+    current_session.working = FALSE;
+    return;
+#endif
+
     /* Create snort process and set up pipes */
     ws_debug("Running %s with config file %s", pref_snort_binary_filename, pref_snort_config_filename);
     if (!g_spawn_async_with_pipes(NULL,          /* working_directory */

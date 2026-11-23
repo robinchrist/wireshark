@@ -583,7 +583,6 @@ set(STRATOSHARK_RC_VERSION ${STRATOSHARK_MAJOR_VERSION},${STRATOSHARK_MINOR_VERS
 
 message(STATUS "V: ${PROJECT_VERSION}, MaV: ${PROJECT_MAJOR_VERSION}, MiV: ${PROJECT_MINOR_VERSION}, PL: ${PROJECT_PATCH_VERSION}, EV: ${PROJECT_VERSION_EXTENSION}.")
 
-include(UseLemon)
 include(UseMakePluginReg)
 include(UseMakeTaps)
 include(UseExecutableResources)
@@ -1556,6 +1555,7 @@ reset_find_package(PCRE2 PCRE2_DEBUG_LIBRARY)
 find_package(PCRE2 REQUIRED)
 reset_find_package(LibXml2)
 find_package(LibXml2 "2.9.7" REQUIRED)
+include(UseLemon)
 
 if (NOT WIN32)
 	find_package(Gettext)
@@ -2938,6 +2938,40 @@ set(EXTCAP_SUPPORT_SRC
 )
 add_library(extcap_support OBJECT ${EXTCAP_SUPPORT_SRC})
 target_compile_options(extcap_support PRIVATE ${WERROR_COMMON_FLAGS})
+
+set(COMMON_PUBLIC_HEADERS
+	ui/summary.h
+	ui/io_graph_item.h
+)
+
+install(FILES ${COMMON_PUBLIC_HEADERS}
+	DESTINATION "${PROJECT_INSTALL_INCLUDEDIR}/common"
+	COMPONENT "Development"
+)
+
+install(FILES app/application_flavor.h
+	DESTINATION "${PROJECT_INSTALL_INCLUDEDIR}/app"
+	COMPONENT "Development"
+)
+
+add_library(wireshark_common
+	ui/summary.c
+	ui/io_graph_item.c
+	app/wireshark_flavor.c
+)
+add_dependencies(wireshark_common vcs_version)
+
+target_include_directories(wireshark_common
+	SYSTEM PRIVATE
+		${GCRYPT_INCLUDE_DIRS}
+)
+
+install(TARGETS wireshark_common
+	EXPORT WiresharkTargets
+	RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+	LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+	ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+)
 
 if(BUILD_wireshark AND QT_FOUND)
 	set(WIRESHARK_SRC

@@ -9,6 +9,14 @@
 
 add_subdirectory(lrexlib)
 
+set(WSLUA_PUBLIC_HEADERS
+	init_wslua.h
+)
+
+install(FILES ${WSLUA_PUBLIC_HEADERS}
+	DESTINATION "${PROJECT_INSTALL_INCLUDEDIR}/epan/wslua"
+)
+
 set(WSLUA_MODULES
 	${CMAKE_CURRENT_SOURCE_DIR}/lua_bitop.c
 	${CMAKE_CURRENT_SOURCE_DIR}/wslua_address.c

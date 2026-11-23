@@ -359,7 +359,12 @@ double asn1_get_real(const uint8_t *real_ptr, int len, int *err) {
       errno = 0;
       feclearexcept(FE_ALL_EXCEPT);
       val = ldexp((double) S * N, exp);
+#if defined(FE_OVERFLOW) && defined(FE_UNDERFLOW)
       if (errno || fetestexcept(FE_OVERFLOW | FE_UNDERFLOW)) {
+#else
+      /* no floating-point exception flags (WebAssembly): ldexp sets errno */
+      if (errno) {
+#endif
         *err = ERANGE;
       }
 #ifndef _MSC_VER
