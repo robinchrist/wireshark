@@ -2659,6 +2659,8 @@ static int hf_bgp_evpn_nlri_esi_reserved;
 static int hf_bgp_evpn_nlri_etag;
 static int hf_bgp_evpn_nlri_mpls_ls1;
 static int hf_bgp_evpn_nlri_mpls_ls2;
+static int hf_bgp_evpn_nlri_mpls_label;
+static int hf_bgp_evpn_nlri_mpls_label_low_bits;
 static int hf_bgp_evpn_nlri_vni;
 static int hf_bgp_evpn_nlri_maclen;
 static int hf_bgp_evpn_nlri_mac_addr;
@@ -2822,7 +2824,6 @@ static int hf_bgp_aigp_accu_igp_metric;
 
 
 /* MPLS labels decoding */
-static int hf_bgp_update_mpls_label;
 static int hf_bgp_update_mpls_label_value;
 static int hf_bgp_update_mpls_label_value_20bits;
 static int hf_bgp_update_mpls_traffic_class;
@@ -3531,7 +3532,7 @@ static int ett_bgp_link_state;
 static int ett_bgp_evpn_nlri;
 static int ett_bgp_evpn_nlri_esi;
 static int ett_bgp_evpn_nlri_mc;
-static int ett_bgp_mpls_labels;
+static int ett_bgp_evpn_nlri_mpls_label;
 static int ett_bgp_pmsi_tunnel_id;
 static int ett_bgp_aigp_attr;
 static int ett_bgp_large_communities;
@@ -3598,6 +3599,7 @@ static expert_field ei_bgp_evpn_nlri_rt_type_err;
 static expert_field ei_bgp_evpn_nlri_rt_len_err;
 static expert_field ei_bgp_evpn_nlri_esi_type_err;
 static expert_field ei_bgp_evpn_nlri_rt4_no_ip;
+static expert_field ei_bgp_evpn_nlri_mpls_label_low_bits;
 
 static expert_field ei_bgp_mup_unknown_at;
 static expert_field ei_bgp_mup_unknown_rt;
@@ -4848,47 +4850,6 @@ decode_MPLS_stack(tvbuff_t *tvb, unsigned offset, wmem_strbuf_t *stack_strbuf)
         indx += 3 ;
     }
 
-    return (indx - offset) / 3;
-}
-
-static unsigned
-decode_MPLS_stack_tree(tvbuff_t *tvb, unsigned offset, proto_tree *parent_tree)
-{
-    uint32_t    label_entry=0;    /* an MPLS label entry (label + COS field + stack bit)   */
-    unsigned    indx;          /* index for the label stack */
-    proto_tree  *labels_tree=NULL;
-    proto_item  *labels_item=NULL;
-    proto_item  *label_item=NULL;
-    indx = offset ;
-    label_entry = 0x000000 ;
-
-    labels_item = proto_tree_add_item(parent_tree, hf_bgp_update_mpls_label, tvb, offset, 3, ENC_NA);
-    proto_item_append_text(labels_item, ": ");
-    labels_tree = proto_item_add_subtree(labels_item, ett_bgp_mpls_labels);
-    while ((label_entry & BGP_MPLS_BOTTOM_L_STACK) == 0) {
-
-        label_entry = tvb_get_ntoh24(tvb, indx);
-        label_item = proto_tree_add_item(labels_tree, hf_bgp_update_mpls_label_value, tvb, indx, 3, ENC_BIG_ENDIAN);
-        /* withdrawn routes may contain 0 or 0x800000 in the first label */
-        if((indx == offset)&&(label_entry==0||label_entry==0x800000)) {
-            proto_item_append_text(labels_item, " (withdrawn)");
-            proto_item_append_text(label_item, " (withdrawn)");
-            return 1;
-        }
-
-        proto_item_append_text(labels_item, "%u%s", label_entry >> 4,
-                ((label_entry & BGP_MPLS_BOTTOM_L_STACK) == 0) ? "," : " (bottom)");
-        proto_item_append_text(label_item, "%u%s", label_entry >> 4,
-                ((label_entry & BGP_MPLS_BOTTOM_L_STACK) == 0) ? "," : " (bottom)");
-        indx += 3 ;
-
-        if ((label_entry & BGP_MPLS_BOTTOM_L_STACK) == 0) {
-            /* real MPLS multi-label stack in BGP? - maybe later; for now, it must be a bogus packet */
-            proto_item_append_text(labels_item, " (BOGUS: Bottom of Stack NOT set!)");
-            break;
-        }
-    }
-    proto_item_set_len(labels_item, (indx - offset));
     return (indx - offset) / 3;
 }
 
@@ -7139,6 +7100,26 @@ static int decode_evpn_nlri_esi(proto_tree *tree, tvbuff_t *tvb, unsigned offset
 /*
  * Decode EVPN NLRI, RFC 7432 section 7.7
  */
+/*
+ * MPLS Label field of an EVPN route: 3 octets, the label in the high-order 20
+ * bits (RFC 7432 section 7.2, RFC 9136 section 3.1). Shown as the label, with
+ * the label bits and the remaining low-order 4 bits below it.
+ */
+static void
+decode_evpn_nlri_mpls_label(proto_tree *tree, tvbuff_t *tvb, unsigned offset, packet_info *pinfo, int hf_label)
+{
+    uint32_t    raw = tvb_get_ntoh24(tvb, offset);
+    proto_item *item;
+    proto_tree *label_tree;
+
+    item = proto_tree_add_uint(tree, hf_label, tvb, offset, 3, raw >> 4);
+    label_tree = proto_item_add_subtree(item, ett_bgp_evpn_nlri_mpls_label);
+    proto_tree_add_item(label_tree, hf_bgp_evpn_nlri_mpls_label, tvb, offset, 3, ENC_BIG_ENDIAN);
+    proto_tree_add_item(label_tree, hf_bgp_evpn_nlri_mpls_label_low_bits, tvb, offset, 3, ENC_BIG_ENDIAN);
+    if (raw & 0x0F)
+        expert_add_info(pinfo, item, &ei_bgp_evpn_nlri_mpls_label_low_bits);
+}
+
 static int decode_evpn_nlri(proto_tree *tree, tvbuff_t *tvb, unsigned offset, packet_info *pinfo) {
     int reader_offset = offset;
     int start_offset = offset+2;
@@ -7167,6 +7148,7 @@ static int decode_evpn_nlri(proto_tree *tree, tvbuff_t *tvb, unsigned offset, pa
     proto_item_append_text(ti, ": %s", val_to_str(pinfo->pool, tvb_get_uint8(tvb, offset), evpnrtypevals, "Unknown capability %d"));
     /* moving to next field */
     reader_offset++;
+
 
     proto_tree_add_item(prefix_tree, hf_bgp_evpn_nlri_len, tvb, reader_offset,
                         1, ENC_BIG_ENDIAN);
@@ -7207,7 +7189,7 @@ static int decode_evpn_nlri(proto_tree *tree, tvbuff_t *tvb, unsigned offset, pa
             proto_tree_add_item(prefix_tree, hf_bgp_evpn_nlri_vni, tvb, reader_offset, 3, ENC_BIG_ENDIAN);
             reader_offset += 3;
         } else {
-            proto_tree_add_item(prefix_tree, hf_bgp_evpn_nlri_mpls_ls1, tvb, reader_offset, 3, ENC_BIG_ENDIAN);
+            decode_evpn_nlri_mpls_label(prefix_tree, tvb, reader_offset, pinfo, hf_bgp_evpn_nlri_mpls_ls1);
             reader_offset += 3;
         }
         total_length = reader_offset - offset;
@@ -7303,12 +7285,12 @@ static int decode_evpn_nlri(proto_tree *tree, tvbuff_t *tvb, unsigned offset, pa
                 reader_offset += 3;
             }
         } else {
-            proto_tree_add_item(prefix_tree, hf_bgp_evpn_nlri_mpls_ls1, tvb, reader_offset, 3, ENC_BIG_ENDIAN);
+            decode_evpn_nlri_mpls_label(prefix_tree, tvb, reader_offset, pinfo, hf_bgp_evpn_nlri_mpls_ls1);
             reader_offset += 3;
             /* we check if we reached the end of the nlri reading fields one by one */
             /* if not, the second optional label is in the payload */
             if (reader_offset - start_offset < nlri_len) {
-                proto_tree_add_item(prefix_tree, hf_bgp_evpn_nlri_mpls_ls2, tvb, reader_offset, 3, ENC_BIG_ENDIAN);
+                decode_evpn_nlri_mpls_label(prefix_tree, tvb, reader_offset, pinfo, hf_bgp_evpn_nlri_mpls_ls2);
                 reader_offset += 3;
             }
         }
@@ -7495,7 +7477,7 @@ static int decode_evpn_nlri(proto_tree *tree, tvbuff_t *tvb, unsigned offset, pa
                         (data->encaps_tunnel_type == BGP_EXT_COM_TUNNEL_VXLAN || data->encaps_tunnel_type == BGP_EXT_COM_TUNNEL_VXLANGPE)) {
                     proto_tree_add_item(prefix_tree, hf_bgp_evpn_nlri_vni, tvb, reader_offset, 3, ENC_BIG_ENDIAN);
                 } else {
-                    decode_MPLS_stack_tree(tvb, reader_offset, prefix_tree);
+                    decode_evpn_nlri_mpls_label(prefix_tree, tvb, reader_offset, pinfo, hf_bgp_evpn_nlri_mpls_ls1);
                 }
                 total_length = 36;
                 break;
@@ -7514,7 +7496,7 @@ static int decode_evpn_nlri(proto_tree *tree, tvbuff_t *tvb, unsigned offset, pa
                         (data->encaps_tunnel_type == BGP_EXT_COM_TUNNEL_VXLAN || data->encaps_tunnel_type == BGP_EXT_COM_TUNNEL_VXLANGPE)) {
                     proto_tree_add_item(prefix_tree, hf_bgp_evpn_nlri_vni, tvb, reader_offset, 3, ENC_BIG_ENDIAN);
                 } else {
-                    decode_MPLS_stack_tree(tvb, reader_offset, prefix_tree);
+                    decode_evpn_nlri_mpls_label(prefix_tree, tvb, reader_offset, pinfo, hf_bgp_evpn_nlri_mpls_ls1);
                 }
                 total_length = 60;
                 break;
@@ -13232,9 +13214,6 @@ proto_register_bgp(void)
       { &hf_bgp_pmsi_tunnel_not_present,
         { "Tunnel ID not present", "bgp.update.path_attribute.pmsi.tunnel_id.not_present", FT_NONE, BASE_NONE,
           NULL, 0x0, NULL, HFILL}},
-      { &hf_bgp_update_mpls_label,
-        { "MPLS Label Stack", "bgp.update.path_attribute.mpls_label", FT_NONE,
-          BASE_NONE, NULL, 0x0, NULL, HFILL}},
       { &hf_bgp_update_mpls_label_value_20bits,
         { "MPLS Label", "bgp.update.path_attribute.mpls_label_value_20bits", FT_UINT24,
           BASE_DEC, NULL, BGP_MPLS_LABEL, NULL, HFILL}},
@@ -14909,10 +14888,16 @@ proto_register_bgp(void)
           BASE_DEC, NULL, 0x0, NULL, HFILL}},
       { &hf_bgp_evpn_nlri_mpls_ls1,
         { "MPLS Label 1", "bgp.evpn.nlri.mpls_ls1", FT_UINT24,
-          BASE_DEC, NULL, BGP_MPLS_LABEL, NULL, HFILL}},
+          BASE_DEC, NULL, 0x0, NULL, HFILL}},
       { &hf_bgp_evpn_nlri_mpls_ls2,
         { "MPLS Label 2", "bgp.evpn.nlri.mpls_ls2", FT_UINT24,
-          BASE_DEC, NULL, BGP_MPLS_LABEL, NULL, HFILL}},
+          BASE_DEC, NULL, 0x0, NULL, HFILL}},
+      { &hf_bgp_evpn_nlri_mpls_label,
+        { "Label", "bgp.evpn.nlri.mpls_label.label", FT_UINT24,
+          BASE_DEC, NULL, BGP_MPLS_LABEL, "MPLS label: high-order 20 bits of the MPLS Label field", HFILL}},
+      { &hf_bgp_evpn_nlri_mpls_label_low_bits,
+        { "Low-order bits", "bgp.evpn.nlri.mpls_label.low_bits", FT_UINT24,
+          BASE_HEX, NULL, 0x00000F, "Low-order 4 bits of the MPLS Label field, outside the label", HFILL}},
       { &hf_bgp_evpn_nlri_vni,
         { "VNI", "bgp.evpn.nlri.vni", FT_UINT24,
           BASE_DEC, NULL, 0x0, NULL, HFILL}},
@@ -15577,7 +15562,7 @@ proto_register_bgp(void)
       &ett_bgp_evpn_nlri,
       &ett_bgp_evpn_nlri_esi,
       &ett_bgp_evpn_nlri_mc,
-      &ett_bgp_mpls_labels,
+      &ett_bgp_evpn_nlri_mpls_label,
       &ett_bgp_pmsi_tunnel_id,
       &ett_bgp_aigp_attr,
       &ett_bgp_large_communities,
@@ -15637,6 +15622,8 @@ proto_register_bgp(void)
         { &ei_bgp_evpn_nlri_rt_len_err, { "bgp.evpn.len", PI_MALFORMED, PI_ERROR, "EVPN Length is invalid", EXPFILL }},
         { &ei_bgp_evpn_nlri_esi_type_err, { "bgp.evpn.esi_type", PI_MALFORMED, PI_ERROR, "EVPN ESI Type is invalid", EXPFILL }},
         { &ei_bgp_evpn_nlri_rt4_no_ip, { "bgp.evpn.no_ip", PI_PROTOCOL, PI_NOTE, "IP Address: NOT INCLUDED", EXPFILL }},
+        { &ei_bgp_evpn_nlri_mpls_label_low_bits, { "bgp.evpn.mpls_label_low_bits", PI_PROTOCOL, PI_WARN,
+          "Low-order 4 bits of the MPLS Label field are set: only the high-order 20 bits carry the label (RFC 7432 section 7.2)", EXPFILL }},
         { &ei_bgp_attr_pmsi_tunnel_type, { "bgp.attr.pmsi.tunnel_type", PI_PROTOCOL, PI_ERROR, "Unknown Tunnel type", EXPFILL }},
         { &ei_bgp_attr_pmsi_opaque_type, { "bgp.attr.pmsi.opaque_type", PI_PROTOCOL, PI_ERROR, "Invalid pmsi opaque type", EXPFILL }},
         { &ei_bgp_attr_aigp_type, { "bgp.attr.aigp.type", PI_MALFORMED, PI_NOTE, "Unknown AIGP attribute type", EXPFILL}},
