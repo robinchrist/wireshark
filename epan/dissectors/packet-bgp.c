@@ -3678,6 +3678,7 @@ load_link_state_data(packet_info *pinfo) {
     return data;
 }
 
+/* Path attributes of the UPDATE being dissected that the NLRI decoding needs */
 typedef struct _path_attr_data {
     bool encaps_community_present;
     uint16_t encaps_tunnel_type;
@@ -3685,24 +3686,47 @@ typedef struct _path_attr_data {
 
 #define PATH_ATTR_DATA_KEY 1
 
+/*
+ * Collect the path attributes the NLRI decoding needs before any attribute
+ * is dissected: MP_REACH_NLRI usually comes before EXTENDED_COMMUNITIES
+ * (RFC 4271 section 5 asks for ascending attribute type order). The result
+ * is kept for this UPDATE only, so each UPDATE of a frame gets its own.
+ */
 static void
-save_path_attr_encaps_tunnel_type(packet_info *pinfo, uint32_t encaps_tunnel_type) {
-    path_attr_data *data =
-        (path_attr_data*)p_get_proto_data(wmem_file_scope(), pinfo, proto_bgp, PATH_ATTR_DATA_KEY);
-    if (!data) {
-        data = wmem_new0(wmem_file_scope(), path_attr_data);
+scan_path_attr_data(tvbuff_t *tvb, unsigned offset, unsigned len, packet_info *pinfo)
+{
+    path_attr_data *data = wmem_new0(pinfo->pool, path_attr_data);
+    unsigned end = offset + MIN(len, tvb_captured_length_remaining(tvb, offset));
+
+    while (offset + 3 <= end) {
+        uint8_t  flags = tvb_get_uint8(tvb, offset);
+        uint8_t  type = tvb_get_uint8(tvb, offset + 1);
+        unsigned hlen = (flags & BGP_ATTR_FLAG_EXTENDED_LENGTH) ? 4 : 3;
+        unsigned alen;
+
+        if (offset + hlen > end)
+            break;
+        alen = (hlen == 4) ? tvb_get_ntohs(tvb, offset + 2) : tvb_get_uint8(tvb, offset + 2);
+        offset += hlen;
+        if (offset + alen > end)
+            break;
+        if (type == BGPTYPE_EXTENDED_COMMUNITY) {
+            for (unsigned c = offset; c + 8 <= offset + alen; c += 8) {
+                if (tvb_get_uint8(tvb, c) == BGP_EXT_COM_TYPE_HIGH_TR_OPAQUE &&
+                        tvb_get_uint8(tvb, c + 1) == BGP_EXT_COM_STYPE_OPA_ENCAP) {
+                    data->encaps_community_present = true;
+                    data->encaps_tunnel_type = tvb_get_ntohs(tvb, c + 6);
+                }
+            }
+        }
+        offset += alen;
     }
-    data->encaps_community_present = true;
-    data->encaps_tunnel_type = encaps_tunnel_type;
-    p_add_proto_data(wmem_file_scope(), pinfo, proto_bgp, PATH_ATTR_DATA_KEY, data);
-    return;
+    p_set_proto_data(pinfo->pool, pinfo, proto_bgp, PATH_ATTR_DATA_KEY, data);
 }
 
 static path_attr_data*
 load_path_attr_data(packet_info *pinfo) {
-    path_attr_data *data =
-        (path_attr_data*)p_get_proto_data(wmem_file_scope(), pinfo, proto_bgp, PATH_ATTR_DATA_KEY);
-    return data;
+    return (path_attr_data*)p_get_proto_data(pinfo->pool, pinfo, proto_bgp, PATH_ATTR_DATA_KEY);
 }
 
 typedef struct _afi_safi_data {
@@ -9470,7 +9494,6 @@ dissect_bgp_update_ext_com(proto_tree *parent_tree, tvbuff_t *tvb, uint16_t tlen
     proto_item      *communities_item=NULL;
     proto_item      *community_item=NULL;
     proto_item      *community_type_item=NULL;
-    uint32_t        encaps_tunnel_type;
     afi_safi_data   *data = NULL;
 
     offset = tvb_off ;
@@ -9679,8 +9702,7 @@ dissect_bgp_update_ext_com(proto_tree *parent_tree, tvbuff_t *tvb, uint16_t tlen
 
                     case BGP_EXT_COM_STYPE_OPA_ENCAP:
                         /* Community octets 2 through 5 are reserved and carry no useful value according to RFC 5512. */
-                        proto_tree_add_item_ret_uint(community_tree, hf_bgp_ext_com_tunnel_type, tvb, offset+6, 2, ENC_BIG_ENDIAN, &encaps_tunnel_type);
-                        save_path_attr_encaps_tunnel_type(pinfo, encaps_tunnel_type);
+                        proto_tree_add_item(community_tree, hf_bgp_ext_com_tunnel_type, tvb, offset+6, 2, ENC_BIG_ENDIAN);
 
                         proto_item_append_text(community_item, " %s",
                                 val_to_str_const(tvb_get_ntohs(tvb,offset+6), bgpext_com_tunnel_type, "Unknown"));
@@ -12232,6 +12254,7 @@ dissect_bgp_update(tvbuff_t *tvb, proto_tree *tree, packet_info *pinfo)
         ti =  proto_tree_add_item(tree, hf_bgp_update_path_attributes, tvb, o+2, len, ENC_NA);
         subtree = proto_item_add_subtree(ti, ett_bgp_attrs);
 
+        scan_path_attr_data(tvb, o+2, len, pinfo);
         dissect_bgp_path_attr(subtree, tvb, len, o+2, pinfo);
 
         o += 2 + len;
