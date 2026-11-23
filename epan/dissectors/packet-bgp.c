@@ -2638,6 +2638,7 @@ static int hf_bgp_bfd_discriminator_tlv_source_ipv6;
 static int hf_bgp_bfd_discriminator_tlv_value;
 static int hf_bgp_evpn_nlri;
 static int hf_bgp_evpn_nlri_rt;
+static int hf_bgp_evpn_nlri_overlay_index;
 static int hf_bgp_evpn_nlri_len;
 static int hf_bgp_evpn_nlri_rd;
 static int hf_bgp_evpn_nlri_esi;
@@ -3600,6 +3601,9 @@ static expert_field ei_bgp_evpn_nlri_rt_len_err;
 static expert_field ei_bgp_evpn_nlri_esi_type_err;
 static expert_field ei_bgp_evpn_nlri_rt4_no_ip;
 static expert_field ei_bgp_evpn_nlri_mpls_label_low_bits;
+static expert_field ei_bgp_evpn_nlri_rt5_esi_and_gw_ip;
+static expert_field ei_bgp_evpn_nlri_rt5_no_overlay_index;
+static expert_field ei_bgp_evpn_nlri_rt5_invalid_router_mac;
 
 static expert_field ei_bgp_mup_unknown_at;
 static expert_field ei_bgp_mup_unknown_rt;
@@ -3684,6 +3688,8 @@ load_link_state_data(packet_info *pinfo) {
 typedef struct _path_attr_data {
     bool encaps_community_present;
     uint16_t encaps_tunnel_type;
+    bool router_mac_present;
+    uint8_t router_mac[6];
 } path_attr_data;
 
 #define PATH_ATTR_DATA_KEY 1
@@ -3718,6 +3724,10 @@ scan_path_attr_data(tvbuff_t *tvb, unsigned offset, unsigned len, packet_info *p
                         tvb_get_uint8(tvb, c + 1) == BGP_EXT_COM_STYPE_OPA_ENCAP) {
                     data->encaps_community_present = true;
                     data->encaps_tunnel_type = tvb_get_ntohs(tvb, c + 6);
+                } else if (tvb_get_uint8(tvb, c) == BGP_EXT_COM_TYPE_HIGH_TR_EVPN &&
+                        tvb_get_uint8(tvb, c + 1) == BGP_EXT_COM_STYPE_EVPN_ROUTERMAC) {
+                    data->router_mac_present = true;
+                    tvb_memcpy(tvb, data->router_mac, c + 2, 6);
                 }
             }
         }
@@ -7120,6 +7130,80 @@ decode_evpn_nlri_mpls_label(proto_tree *tree, tvbuff_t *tvb, unsigned offset, pa
         expert_add_info(pinfo, item, &ei_bgp_evpn_nlri_mpls_label_low_bits);
 }
 
+/* Overlay Index of an IP Prefix route (RFC 9136 section 3.2) */
+#define EVPN_OVERLAY_INDEX_NONE         0
+#define EVPN_OVERLAY_INDEX_ESI          1
+#define EVPN_OVERLAY_INDEX_GW_IP        2
+#define EVPN_OVERLAY_INDEX_MAC          3
+#define EVPN_OVERLAY_INDEX_MAC_OR_NONE  4
+
+static const value_string evpn_overlay_index_vals[] = {
+    { EVPN_OVERLAY_INDEX_NONE,        "None" },
+    { EVPN_OVERLAY_INDEX_ESI,         "ESI" },
+    { EVPN_OVERLAY_INDEX_GW_IP,       "GW IP" },
+    { EVPN_OVERLAY_INDEX_MAC,         "MAC" },
+    { EVPN_OVERLAY_INDEX_MAC_OR_NONE, "MAC or None" },
+    { 0, NULL }
+};
+
+static bool
+evpn_bytes_are_zero(tvbuff_t *tvb, unsigned offset, unsigned len)
+{
+    for (unsigned i = 0; i < len; i++) {
+        if (tvb_get_uint8(tvb, offset + i) != 0)
+            return false;
+    }
+    return true;
+}
+
+/*
+ * Derive the Overlay Index of an IP Prefix route from its ESI, GW IP Address
+ * and label and the UPDATE's Router's MAC extended community (RFC 9136 section
+ * 3.2, Table 1), or flag the combinations to be treated as withdraw.
+ */
+static void
+decode_evpn_rt5_overlay_index(proto_tree *tree, proto_item *nlri_item, tvbuff_t *tvb, packet_info *pinfo,
+                              unsigned esi_offset, unsigned gw_offset, unsigned gw_len,
+                              unsigned label_offset, bool is_vni)
+{
+    path_attr_data *data = load_path_attr_data(pinfo);
+    bool esi = !evpn_bytes_are_zero(tvb, esi_offset, 10);
+    bool gw_ip = !evpn_bytes_are_zero(tvb, gw_offset, gw_len);
+    uint32_t label = tvb_get_ntoh24(tvb, label_offset);
+    uint32_t overlay_index;
+    proto_item *item;
+
+    if (!is_vni)
+        label >>= 4;    /* the label is in the high-order 20 bits */
+
+    if (esi && gw_ip) {
+        expert_add_info(pinfo, nlri_item, &ei_bgp_evpn_nlri_rt5_esi_and_gw_ip);
+        return;
+    } else if (esi) {
+        overlay_index = EVPN_OVERLAY_INDEX_ESI;
+    } else if (gw_ip) {
+        overlay_index = EVPN_OVERLAY_INDEX_GW_IP;
+    } else if (data && data->router_mac_present) {
+        if (data->router_mac[0] & 0x01) {   /* multicast or broadcast */
+            expert_add_info(pinfo, nlri_item, &ei_bgp_evpn_nlri_rt5_invalid_router_mac);
+            return;
+        }
+        overlay_index = label == 0 ? EVPN_OVERLAY_INDEX_MAC : EVPN_OVERLAY_INDEX_MAC_OR_NONE;
+    } else if (label == 0) {
+        expert_add_info(pinfo, nlri_item, &ei_bgp_evpn_nlri_rt5_no_overlay_index);
+        return;
+    } else {
+        overlay_index = EVPN_OVERLAY_INDEX_NONE;
+    }
+
+    /* the numbers are only internal: show the name alone (filters can use it too) */
+    item = proto_tree_add_uint_format_value(tree, hf_bgp_evpn_nlri_overlay_index, tvb, 0, 0, overlay_index, "%s",
+                                            val_to_str_const(overlay_index, evpn_overlay_index_vals, "Unknown"));
+    proto_item_set_generated(item);
+    proto_item_append_text(nlri_item, " (Overlay Index: %s)",
+                           val_to_str_const(overlay_index, evpn_overlay_index_vals, "Unknown"));
+}
+
 static int decode_evpn_nlri(proto_tree *tree, tvbuff_t *tvb, unsigned offset, packet_info *pinfo) {
     int reader_offset = offset;
     int start_offset = offset+2;
@@ -7133,6 +7217,7 @@ static int decode_evpn_nlri(proto_tree *tree, tvbuff_t *tvb, unsigned offset, pa
     path_attr_data *data = NULL;
     proto_item *item;
     int ret;
+    bool is_vni;
 
     route_type = tvb_get_uint8(tvb, offset);
 
@@ -7149,6 +7234,19 @@ static int decode_evpn_nlri(proto_tree *tree, tvbuff_t *tvb, unsigned offset, pa
     /* moving to next field */
     reader_offset++;
 
+    /* the Overlay Index of an IP Prefix route goes right below its Route Type; the fields it is
+     * derived from are at fixed offsets: RD, ESI, Ethernet Tag ID, IP Prefix Length, IP Prefix,
+     * GW IP Address (4 or 16 octets each), MPLS Label */
+    if (route_type == EVPN_IP_PREFIX_ROUTE && (nlri_len == 34 || nlri_len == 58) &&
+            tvb_bytes_exist(tvb, offset, nlri_len + 2)) {
+        unsigned addr_len = (nlri_len == 34) ? 4 : 16;
+
+        data = load_path_attr_data(pinfo);
+        is_vni = data && data->encaps_community_present &&
+                (data->encaps_tunnel_type == BGP_EXT_COM_TUNNEL_VXLAN || data->encaps_tunnel_type == BGP_EXT_COM_TUNNEL_VXLANGPE);
+        decode_evpn_rt5_overlay_index(prefix_tree, ti, tvb, pinfo, offset + 10, offset + 25 + addr_len, addr_len,
+                                      offset + 25 + 2 * addr_len, is_vni);
+    }
 
     proto_tree_add_item(prefix_tree, hf_bgp_evpn_nlri_len, tvb, reader_offset,
                         1, ENC_BIG_ENDIAN);
@@ -14829,6 +14927,9 @@ proto_register_bgp(void)
       { &hf_bgp_evpn_nlri_rt,
         { "Route Type", "bgp.evpn.nlri.rt", FT_UINT8, BASE_DEC,
           VALS(evpnrtypevals), 0x0, NULL, HFILL }},
+      { &hf_bgp_evpn_nlri_overlay_index,
+        { "Overlay Index", "bgp.evpn.nlri.overlay_index", FT_UINT8, BASE_DEC,
+          VALS(evpn_overlay_index_vals), 0x0, "Overlay Index derived as in RFC 9136 section 3.2", HFILL}},
       { &hf_bgp_evpn_nlri_len,
         { "Length", "bgp.evpn.nlri.len", FT_UINT8,
           BASE_DEC, NULL, 0x0, NULL, HFILL}},
@@ -15624,6 +15725,12 @@ proto_register_bgp(void)
         { &ei_bgp_evpn_nlri_rt4_no_ip, { "bgp.evpn.no_ip", PI_PROTOCOL, PI_NOTE, "IP Address: NOT INCLUDED", EXPFILL }},
         { &ei_bgp_evpn_nlri_mpls_label_low_bits, { "bgp.evpn.mpls_label_low_bits", PI_PROTOCOL, PI_WARN,
           "Low-order 4 bits of the MPLS Label field are set: only the high-order 20 bits carry the label (RFC 7432 section 7.2)", EXPFILL }},
+        { &ei_bgp_evpn_nlri_rt5_esi_and_gw_ip, { "bgp.evpn.rt5.esi_and_gw_ip", PI_PROTOCOL, PI_WARN,
+          "ESI and GW IP Address both set: to be treated as withdraw (RFC 9136 section 3.2)", EXPFILL }},
+        { &ei_bgp_evpn_nlri_rt5_no_overlay_index, { "bgp.evpn.rt5.no_overlay_index", PI_PROTOCOL, PI_WARN,
+          "No Overlay Index and label 0: to be treated as withdraw (RFC 9136 section 3.1)", EXPFILL }},
+        { &ei_bgp_evpn_nlri_rt5_invalid_router_mac, { "bgp.evpn.rt5.invalid_router_mac", PI_PROTOCOL, PI_WARN,
+          "Router's MAC is not a unicast MAC: to be treated as withdraw (RFC 9136 section 3.2)", EXPFILL }},
         { &ei_bgp_attr_pmsi_tunnel_type, { "bgp.attr.pmsi.tunnel_type", PI_PROTOCOL, PI_ERROR, "Unknown Tunnel type", EXPFILL }},
         { &ei_bgp_attr_pmsi_opaque_type, { "bgp.attr.pmsi.opaque_type", PI_PROTOCOL, PI_ERROR, "Invalid pmsi opaque type", EXPFILL }},
         { &ei_bgp_attr_aigp_type, { "bgp.attr.aigp.type", PI_MALFORMED, PI_NOTE, "Unknown AIGP attribute type", EXPFILL}},
